@@ -301,7 +301,7 @@ func followInstallation(f *clientcmd.Factory, input string, pod *kapi.Pod, kclie
 	// we cannot retrieve logs until the pod is out of pending
 	// TODO: move this to the server side
 	podClient := kclient.Pods(pod.Namespace)
-	if err := wait.PollImmediate(500*time.Millisecond, 60*time.Second, installationStarted(podClient, pod.Name, kclient.Secrets(pod.Namespace))); err != nil {
+	if err := wait.PollImmediate(500*time.Millisecond, 180*time.Second, installationStarted(podClient, pod.Name, kclient.Secrets(pod.Namespace))); err != nil {
 		return err
 	}
 
