@@ -14,12 +14,14 @@ import (
 	utilerrs "k8s.io/kubernetes/pkg/util/errors"
 	"k8s.io/kubernetes/pkg/util/sets"
 
+	"github.com/docker/libcompose/config"
+	"github.com/docker/libcompose/project"
+
 	deployapi "github.com/openshift/origin/pkg/deploy/api"
 	"github.com/openshift/origin/pkg/generate/app"
 	"github.com/openshift/origin/pkg/generate/git"
 	templateapi "github.com/openshift/origin/pkg/template/api"
 	dockerfileutil "github.com/openshift/origin/pkg/util/docker/dockerfile"
-	"github.com/openshift/origin/third_party/github.com/docker/libcompose/project"
 )
 
 func IsPossibleDockerCompose(path string) bool {
@@ -49,10 +51,14 @@ func Generate(paths ...string) (*templateapi.Template, error) {
 	context := &project.Context{
 		ComposeFiles: paths,
 	}
-	p := project.NewProject(context)
-	if err := project.AddEnvironmentLookUp(context); err != nil {
-		return nil, err
-	}
+	p := project.NewProject(context, nil, nil)
+
+	// TODO: figure out how to handle Enviroment
+	// this is no longer working
+	// if err := project.AddEnvironmentLookUp(context); err != nil {
+	//	return nil, err
+	//}
+
 	if err := p.Parse(); err != nil {
 		return nil, err
 	}
@@ -61,7 +67,8 @@ func Generate(paths ...string) (*templateapi.Template, error) {
 
 	serviceOrder := sets.NewString()
 	warnings := make(map[string][]string)
-	for k, v := range p.Configs {
+	for _, k := range p.ServiceConfigs.Keys() {
+		v, _ := p.ServiceConfigs.Get(k)
 		serviceOrder.Insert(k)
 		warnUnusableComposeElements(k, v, warnings)
 	}
@@ -79,7 +86,7 @@ func Generate(paths ...string) (*templateapi.Template, error) {
 		if joins[k] == nil {
 			joins[k] = sets.NewString(k)
 		}
-		v := p.Configs[k]
+		v, _ := p.ServiceConfigs.Get(k)
 		for _, from := range v.VolumesFrom {
 			switch parts := strings.Split(from, ":"); len(parts) {
 			case 1:
@@ -124,37 +131,37 @@ func Generate(paths ...string) (*templateapi.Template, error) {
 
 	// identify service aliases
 	aliases := make(map[string]sets.String)
-	for _, v := range p.Configs {
-		for _, s := range v.Links.Slice() {
-			parts := strings.SplitN(s, ":", 2)
-			if len(parts) != 2 || parts[0] == parts[1] {
+	for _, k := range p.ServiceConfigs.Keys() {
+		v, _ := p.ServiceConfigs.Get(k)
+		for service, alias := range v.Links.ToMap() {
+			if service == alias {
 				continue
 			}
-			set := aliases[parts[0]]
+			set := aliases[service]
 			if set == nil {
 				set = sets.NewString()
-				aliases[parts[0]] = set
+				aliases[service] = set
 			}
-			set.Insert(parts[1])
+			set.Insert(alias)
 		}
 	}
 
 	// find and define build pipelines
 	for _, k := range serviceOrder.List() {
-		v := p.Configs[k]
-		if len(v.Build) == 0 {
+		v, _ := p.ServiceConfigs.Get(k)
+		if len(v.Build.Context) == 0 {
 			continue
 		}
-		if _, ok := builds[v.Build]; ok {
+		if _, ok := builds[v.Build.Context]; ok {
 			continue
 		}
 		var base, relative string
 		for _, s := range bases {
-			if !strings.HasPrefix(v.Build, s) {
+			if !strings.HasPrefix(v.Build.Context, s) {
 				continue
 			}
 			base = s
-			path, err := filepath.Rel(base, v.Build)
+			path, err := filepath.Rel(base, v.Build.Context)
 			if err != nil {
 				return nil, fmt.Errorf("path is not relative to base: %v", err)
 			}
@@ -226,7 +233,7 @@ func Generate(paths ...string) (*templateapi.Template, error) {
 		pipeline.Image.ObjectName = k
 		glog.V(4).Infof("created pipeline %+v", pipeline)
 
-		builds[v.Build] = pipeline
+		builds[v.Build.Context] = pipeline
 		pipelines = append(pipelines, pipeline)
 	}
 
@@ -239,7 +246,7 @@ func Generate(paths ...string) (*templateapi.Template, error) {
 		var group app.PipelineGroup
 		commonMounts := make(map[string]string)
 		for _, k := range pod.List() {
-			v := p.Configs[k]
+			v, _ := p.ServiceConfigs.Get(k)
 			glog.V(4).Infof("compose service: %#v", v)
 			var inputImage *app.ImageRef
 			if len(v.Image) != 0 {
@@ -255,7 +262,7 @@ func Generate(paths ...string) (*templateapi.Template, error) {
 				inputImage = image
 			}
 			if inputImage == nil {
-				if previous, ok := builds[v.Build]; ok {
+				if previous, ok := builds[v.Build.Context]; ok {
 					inputImage = previous.Image
 				}
 			}
@@ -274,14 +281,14 @@ func Generate(paths ...string) (*templateapi.Template, error) {
 						c.Ports = append(c.Ports, kapi.ContainerPort{ContainerPort: int32(port)})
 					}
 				}
-				c.Args = v.Command.Slice()
-				if len(v.Entrypoint.Slice()) > 0 {
-					c.Command = v.Entrypoint.Slice()
+				c.Args = v.Command
+				if len(v.Entrypoint) > 0 {
+					c.Command = v.Entrypoint
 				}
 				if len(v.WorkingDir) > 0 {
 					c.WorkingDir = v.WorkingDir
 				}
-				c.Env = append(c.Env, app.ParseEnvironment(v.Environment.Slice()...).List()...)
+				c.Env = append(c.Env, app.ParseEnvironment(v.Environment...).List()...)
 				if uid, err := strconv.Atoi(v.User); err == nil {
 					uid64 := int64(uid)
 					if c.SecurityContext == nil {
@@ -479,7 +486,7 @@ func rangeToPort(s string) string {
 }
 
 // warnUnusableComposeElements add warnings for unsupported elements in the provided service config
-func warnUnusableComposeElements(k string, v *project.ServiceConfig, warnings map[string][]string) {
+func warnUnusableComposeElements(k string, v *config.ServiceConfig, warnings map[string][]string) {
 	fn := func(msg string) {
 		warnings[msg] = append(warnings[msg], k)
 	}
@@ -496,7 +503,7 @@ func warnUnusableComposeElements(k string, v *project.ServiceConfig, warnings ma
 	if len(v.Devices) > 0 {
 		fn("devices are not supported")
 	}
-	if v.DNS.Len() > 0 || v.DNSSearch.Len() > 0 {
+	if len(v.DNS) > 0 || len(v.DNSSearch) > 0 {
 		fn("dns and dns_search are not supported")
 	}
 	if len(v.DomainName) > 0 {
@@ -505,20 +512,20 @@ func warnUnusableComposeElements(k string, v *project.ServiceConfig, warnings ma
 	if len(v.Hostname) > 0 {
 		fn("hostname is not supported")
 	}
-	if len(v.Labels.MapParts()) > 0 {
+	if len(v.Labels) > 0 {
 		fn("labels is ignored")
 	}
-	if len(v.Links.Slice()) > 0 {
+	if len(v.Links) > 0 {
 		//fn("links are not supported, use services to talk to other pods")
 		// TODO: display some sort of warning when linking will be inconsistent
 	}
-	if len(v.LogDriver) > 0 {
+	if len(v.Logging.Driver) > 0 {
 		fn("log_driver is not supported")
 	}
 	if len(v.MacAddress) > 0 {
 		fn("mac_address is not supported")
 	}
-	if len(v.Net) > 0 {
+	if v.Networks != nil && len(v.Networks.Networks) > 0 {
 		fn("net is not supported")
 	}
 	if len(v.Pid) > 0 {
@@ -554,7 +561,7 @@ func warnUnusableComposeElements(k string, v *project.ServiceConfig, warnings ma
 	if len(v.ExternalLinks) > 0 {
 		fn("external_links are not supported - use services")
 	}
-	if len(v.LogOpt) > 0 {
+	if len(v.Logging.Options) > 0 {
 		fn("log_opt is not supported")
 	}
 	if len(v.ExtraHosts) > 0 {
